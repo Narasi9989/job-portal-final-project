@@ -1,64 +1,271 @@
 pipeline {
     agent any
 
-    // Environment variables for the pipeline
-    environment {
-        // Project Information
-        PROJECT_NAME = 'JobPortal'
-        PROJECT_VERSION = '1.0.0'
-        
-        // Docker Configuration
-        DOCKER_REGISTRY = "docker.io"
-        DOCKER_IMAGE_BACKEND = "job-portal-backend"
-        DOCKER_IMAGE_FRONTEND = "job-portal-frontend"
-        DOCKER_IMAGE_TAG = "${BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
-        
-        // Application Configuration
-        PYTHONUNBUFFERED = '1'
-        PYTHONDONTWRITEBYTECODE = '1'
-        NODE_ENV = 'production'
-        
-        // Build Paths
-        BACKEND_PATH = 'backend_fastapi'
-        FRONTEND_PATH = 'goskill-frontend'
-        
-        // Timeout for service health checks (in seconds)
-        HEALTH_CHECK_TIMEOUT = '120'
-        HEALTH_CHECK_RETRIES = '60'
-        HEALTH_CHECK_INTERVAL = '2'
-    }
-
     options {
-        // Keep last 10 builds
-        buildDiscarder(logRotator(numToKeepStr: '10'))
-        
-        // Build timeout
         timeout(time: 1, unit: 'HOURS')
-        
-        // Disable concurrent builds
-        disableConcurrentBuilds()
-        
-        // Timestamps in console output
-        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
     }
 
-    parameters {
-        choice(
-            name: 'DEPLOYMENT_ENVIRONMENT',
-            choices: ['development', 'staging', 'production'],
-            description: 'Target deployment environment'
-        )
-        booleanParam(
-            name: 'SKIP_TESTS',
-            defaultValue: false,
-            description: 'Skip running tests'
-        )
-        booleanParam(
-            name: 'PUSH_TO_REGISTRY',
-            defaultValue: false,
-            description: 'Push Docker images to registry'
-        )
+    environment {
+        DOCKER_IMAGE_BACKEND = "narasi9989/job-portal-backend:latest"
+        DOCKER_IMAGE_FRONTEND = "narasi9989/job-portal-frontend:latest"
+        PYTHON_VERSION = "3.11"
     }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                script {
+                    echo "Checking out source code from SCM..."
+                }
+                checkout scm
+            }
+        }
+
+        stage('Verify Project Structure') {
+            steps {
+                script {
+                    echo "Verifying project structure..."
+                    bat '''
+                        if not exist backend_fastapi (
+                            echo ERROR: backend_fastapi directory not found
+                            exit /b 1
+                        )
+                        if not exist goskill-frontend (
+                            echo ERROR: goskill-frontend directory not found
+                            exit /b 1
+                        )
+                        if not exist backend_fastapi\\requirements.txt (
+                            echo ERROR: backend_fastapi\\requirements.txt not found
+                            exit /b 1
+                        )
+                        if not exist goskill-frontend\\package.json (
+                            echo ERROR: goskill-frontend\\package.json not found
+                            exit /b 1
+                        )
+                        echo Project structure verified successfully
+                    '''
+                }
+            }
+        }
+
+        stage('Backend Dependencies') {
+            steps {
+                script {
+                    echo "Installing backend dependencies..."
+                }
+                dir('backend_fastapi') {
+                    bat '''
+                        if not exist venv (
+                            echo Creating Python virtual environment...
+                            python -m venv venv
+                        )
+
+                        call venv\\Scripts\\activate.bat
+                        python -m pip install --upgrade pip setuptools wheel
+                        pip install -r requirements.txt
+                        echo Backend dependencies installed successfully
+                    '''
+                }
+            }
+        }
+
+        stage('Backend Verification') {
+            steps {
+                script {
+                    echo "Verifying backend configuration..."
+                }
+                dir('backend_fastapi') {
+                    bat '''
+                        call venv\\Scripts\\activate.bat
+                        python -c "import fastapi; import oracledb; print('Backend dependencies verified')"
+                        if errorlevel 1 (
+                            echo ERROR: Backend dependencies verification failed
+                            exit /b 1
+                        )
+                    '''
+                }
+            }
+        }
+
+        stage('Frontend Dependencies') {
+            steps {
+                script {
+                    echo "Installing frontend dependencies..."
+                }
+                dir('goskill-frontend') {
+                    bat '''
+                        if not exist node_modules (
+                            echo Installing npm packages...
+                            call npm ci
+                        ) else (
+                            echo npm packages already installed, verifying...
+                            call npm ci
+                        )
+                        echo Frontend dependencies installed successfully
+                    '''
+                }
+            }
+        }
+
+        stage('Frontend Build') {
+            steps {
+                script {
+                    echo "Building frontend application..."
+                }
+                dir('goskill-frontend') {
+                    bat '''
+                        call npm run build
+                        if errorlevel 1 (
+                            echo ERROR: Frontend build failed
+                            exit /b 1
+                        )
+                        if not exist dist (
+                            echo ERROR: dist directory not created after build
+                            exit /b 1
+                        )
+                        echo Frontend build completed successfully
+                    '''
+                }
+            }
+        }
+
+        stage('Build Docker Images') {
+            steps {
+                script {
+                    echo "Building Docker images..."
+                }
+                bat '''
+                    echo Building backend Docker image from backend_fastapi\\Dockerfile...
+                    docker build -t %DOCKER_IMAGE_BACKEND% backend_fastapi
+                    if errorlevel 1 (
+                        echo ERROR: Failed to build backend Docker image
+                        exit /b 1
+                    )
+
+                    echo Building frontend Docker image from goskill-frontend\\Dockerfile...
+                    docker build -t %DOCKER_IMAGE_FRONTEND% goskill-frontend
+                    if errorlevel 1 (
+                        echo ERROR: Failed to build frontend Docker image
+                        exit /b 1
+                    )
+                    echo Docker images built successfully
+                '''
+            }
+        }
+
+        stage('Verify Docker Images') {
+            steps {
+                script {
+                    echo "Verifying Docker images..."
+                }
+                bat '''
+                    echo Checking backend image...
+                    docker image inspect %DOCKER_IMAGE_BACKEND% > nul
+                    if errorlevel 1 (
+                        echo ERROR: Backend Docker image not found
+                        exit /b 1
+                    )
+
+                    echo Checking frontend image...
+                    docker image inspect %DOCKER_IMAGE_FRONTEND% > nul
+                    if errorlevel 1 (
+                        echo ERROR: Frontend Docker image not found
+                        exit /b 1
+                    )
+                    echo Docker images verified successfully
+                '''
+            }
+        }
+
+        stage('Push Docker Images') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo "Pushing Docker images to registry..."
+                }
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'docker-hub-credentials',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )
+                ]) {
+                    bat '''
+                        echo Logging into Docker registry...
+                        echo %DOCKER_PASS% | docker login -u %DOCKER_USER% --password-stdin
+                        if errorlevel 1 (
+                            echo ERROR: Docker login failed
+                            exit /b 1
+                        )
+
+                        echo Pushing backend image...
+                        docker push %DOCKER_IMAGE_BACKEND%
+                        if errorlevel 1 (
+                            echo ERROR: Failed to push backend image
+                            docker logout
+                            exit /b 1
+                        )
+
+                        echo Pushing frontend image...
+                        docker push %DOCKER_IMAGE_FRONTEND%
+                        if errorlevel 1 (
+                            echo ERROR: Failed to push frontend image
+                            docker logout
+                            exit /b 1
+                        )
+
+                        docker logout
+                        echo Docker images pushed successfully
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                echo "✓ Pipeline completed successfully!"
+                echo "Build Summary:"
+                echo "  - Backend: Verified and packaged"
+                echo "  - Frontend: Built and packaged"
+                echo "  - Docker Images: Created and verified"
+                if (env.BRANCH_NAME == 'main') {
+                    echo "  - Registry: Images pushed successfully"
+                }
+            }
+        }
+
+        failure {
+            script {
+                echo "✗ Pipeline failed!"
+                echo "Troubleshooting steps:"
+                echo "  1. Check console output above for specific error messages"
+                echo "  2. Verify project structure and dependencies"
+                echo "  3. Ensure Docker daemon is running"
+                echo "  4. Check Docker Hub credentials in Jenkins"
+                echo "  5. Review backend_fastapi/requirements.txt and goskill-frontend/package.json"
+            }
+        }
+
+        unstable {
+            script {
+                echo "⚠ Pipeline is unstable - some steps may have issues"
+            }
+        }
+
+        always {
+            script {
+                echo "Cleaning up workspace..."
+                cleanWs()
+            }
+        }
+    }
+}
 
     stages {
         stage('Checkout Source Code') {
