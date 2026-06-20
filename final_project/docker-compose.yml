@@ -1,0 +1,92 @@
+version: '3.8'
+
+services:
+  oracle-db:
+    image: gvenzl/oracle-xe:latest
+    container_name: oracle-db
+    environment:
+      ORACLE_PASSWORD: narasimha
+    ports:
+      - "1521:1521"
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+
+
+    healthcheck:
+      test: ["CMD", "sqlplus", "-S", "sys/narasimha@localhost:1521/XE", "as", "sysdba", "select 1 from dual;"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    networks:
+      - job-portal-network
+    restart: unless-stopped
+
+  # FastAPI Backend Service
+  backend:
+    build:
+      context: ./backend_fastapi
+      dockerfile: Dockerfile
+    container_name: job-portal-backend
+    depends_on:
+      oracle-db:
+        condition: service_healthy
+    environment:
+      ORACLE_USER: ${ORACLE_USER:-narasimha}
+      ORACLE_PASSWORD: ${ORACLE_PASSWORD:-narasimha}
+      ORACLE_HOST: ${ORACLE_HOST:-oracle-db}
+      ORACLE_PORT: ${ORACLE_PORT:-1521}
+      ORACLE_SERVICE: ${ORACLE_SERVICE:-XE}
+      ORACLE_DSN: ${ORACLE_DSN:-}
+      ORACLE_CONFIG_DIR: ${ORACLE_CONFIG_DIR:-/app/oracle_config}
+      ORACLE_USE_THICK_MODE: ${ORACLE_USE_THICK_MODE:-false}
+      PYTHONUNBUFFERED: 1
+      PYTHONDONTWRITEBYTECODE: 1
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend_fastapi:/app
+      - backend-uploads:/app/uploads
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - job-portal-network
+    restart: unless-stopped
+
+  # React Frontend Service
+  frontend:
+    build:
+      context: ./goskill-frontend
+      dockerfile: Dockerfile
+    container_name: job-portal-frontend
+    depends_on:
+      - backend
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./goskill-frontend/src:/app/src
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - job-portal-network
+    restart: unless-stopped
+
+volumes:
+  oracle-data:
+    driver: local
+  backend-uploads:
+    driver: local
+
+networks:
+  job-portal-network:
+    driver: bridge

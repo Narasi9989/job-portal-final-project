@@ -1,0 +1,6 @@
+INFO:     Started server process [10396]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+Oracle client initialized from C:\instantclient_23_0
+INFO:     127.0.0.1:52446 - "GET / HTTP/1.1" 200 OK

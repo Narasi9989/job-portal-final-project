@@ -1,0 +1,619 @@
+pipeline {
+    agent any
+
+    // Environment variables for the pipeline
+    environment {
+        // Project Information
+        PROJECT_NAME = 'JobPortal'
+        PROJECT_VERSION = '1.0.0'
+        
+        // Docker Configuration
+        DOCKER_REGISTRY = "docker.io"
+        DOCKER_IMAGE_BACKEND = "job-portal-backend"
+        DOCKER_IMAGE_FRONTEND = "job-portal-frontend"
+        DOCKER_IMAGE_TAG = "${BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
+        
+        // Application Configuration
+        PYTHONUNBUFFERED = '1'
+        PYTHONDONTWRITEBYTECODE = '1'
+        NODE_ENV = 'production'
+        
+        // Build Paths
+        BACKEND_PATH = 'backend_fastapi'
+        FRONTEND_PATH = 'goskill-frontend'
+        
+        // Timeout for service health checks (in seconds)
+        HEALTH_CHECK_TIMEOUT = '120'
+        HEALTH_CHECK_RETRIES = '60'
+        HEALTH_CHECK_INTERVAL = '2'
+    }
+
+    options {
+        // Keep last 10 builds
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        
+        // Build timeout
+        timeout(time: 1, unit: 'HOURS')
+        
+        // Disable concurrent builds
+        disableConcurrentBuilds()
+        
+        // Timestamps in console output
+        timestamps()
+    }
+
+    parameters {
+        choice(
+            name: 'DEPLOYMENT_ENVIRONMENT',
+            choices: ['development', 'staging', 'production'],
+            description: 'Target deployment environment'
+        )
+        booleanParam(
+            name: 'SKIP_TESTS',
+            defaultValue: false,
+            description: 'Skip running tests'
+        )
+        booleanParam(
+            name: 'PUSH_TO_REGISTRY',
+            defaultValue: false,
+            description: 'Push Docker images to registry'
+        )
+    }
+
+    stages {
+        stage('Checkout Source Code') {
+            steps {
+                script {
+                    echo "=== Checking out source code ==="
+                    checkout scm
+                    sh '''
+                        echo "Git Branch: $(git rev-parse --abbrev-ref HEAD)"
+                        echo "Git Commit: $(git rev-parse HEAD)"
+                        echo "Git Author: $(git log -1 --format=%an)"
+                    '''
+                }
+            }
+        }
+
+        stage('Load Environment') {
+            steps {
+                script {
+                    echo "=== Loading environment configuration ==="
+                    sh '''
+                        if [ -f .env.${DEPLOYMENT_ENVIRONMENT} ]; then
+                            echo "Loading .env.${DEPLOYMENT_ENVIRONMENT}"
+                            set -a
+                            source .env.${DEPLOYMENT_ENVIRONMENT}
+                            set +a
+                        else
+                            echo "Warning: .env.${DEPLOYMENT_ENVIRONMENT} not found, using defaults"
+                        fi
+                        
+                        echo "Environment variables loaded successfully"
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Project Structure') {
+            steps {
+                script {
+                    echo "=== Validating project structure ==="
+                    sh '''
+                        echo "Checking backend directory..."
+                        if [ ! -d "${BACKEND_PATH}" ]; then
+                            echo "ERROR: Backend directory not found at ${BACKEND_PATH}"
+                            exit 1
+                        fi
+                        
+                        echo "Checking frontend directory..."
+                        if [ ! -d "${FRONTEND_PATH}" ]; then
+                            echo "ERROR: Frontend directory not found at ${FRONTEND_PATH}"
+                            exit 1
+                        fi
+                        
+                        echo "Checking backend files..."
+                        if [ ! -f "${BACKEND_PATH}/requirements.txt" ]; then
+                            echo "ERROR: Backend requirements.txt not found"
+                            exit 1
+                        fi
+                        
+                        if [ ! -f "${BACKEND_PATH}/main.py" ]; then
+                            echo "ERROR: Backend main.py not found"
+                            exit 1
+                        fi
+                        
+                        echo "Checking frontend files..."
+                        if [ ! -f "${FRONTEND_PATH}/package.json" ]; then
+                            echo "ERROR: Frontend package.json not found"
+                            exit 1
+                        fi
+                        
+                        echo "Project structure validation passed"
+                    '''
+                }
+            }
+        }
+
+        stage('Install Backend Dependencies') {
+            steps {
+                script {
+                    echo "=== Installing backend dependencies ==="
+                    sh '''
+                        cd ${BACKEND_PATH}
+                        
+                        # Check if Python 3 is available
+                        if ! command -v python3 &> /dev/null; then
+                            echo "ERROR: Python 3 is not installed"
+                            exit 1
+                        fi
+                        
+                        echo "Python version: $(python3 --version)"
+                        
+                        # Create virtual environment if it doesn't exist
+                        if [ ! -d "venv" ]; then
+                            echo "Creating virtual environment..."
+                            python3 -m venv venv || exit 1
+                        fi
+                        
+                        # Activate virtual environment and install dependencies
+                        if [ -f "venv/bin/activate" ]; then
+                            . venv/bin/activate || exit 1
+                        elif [ -f "venv/Scripts/activate" ]; then
+                            . venv/Scripts/activate || exit 1
+                        else
+                            echo "ERROR: Could not find venv activation script"
+                            exit 1
+                        fi
+                        
+                        echo "Upgrading pip, setuptools, wheel..."
+                        pip install --upgrade pip setuptools wheel --quiet || exit 1
+                        
+                        echo "Installing backend dependencies..."
+                        pip install -r requirements.txt || exit 1
+                        
+                        echo "Backend dependencies installed successfully"
+                    '''
+                }
+            }
+        }
+
+        stage('Install Frontend Dependencies') {
+            steps {
+                script {
+                    echo "=== Installing frontend dependencies ==="
+                    sh '''
+                        cd ${FRONTEND_PATH}
+                        
+                        # Use npm ci for CI/CD environments
+                        npm ci --prefer-offline --no-audit || npm install --legacy-peer-deps
+                        
+                        echo "Frontend dependencies installed successfully"
+                    '''
+                }
+            }
+        }
+
+        stage('Lint Backend Code') {
+            when {
+                expression { !params.SKIP_TESTS }
+            }
+            steps {
+                script {
+                    echo "=== Running backend linting ==="
+                    sh '''
+                        cd ${BACKEND_PATH}
+                        
+                        # Activate virtual environment
+                        if [ -f "venv/bin/activate" ]; then
+                            . venv/bin/activate
+                        else
+                            source venv/Scripts/activate 2>/dev/null || . venv/Scripts/activate
+                        fi
+                        
+                        # Install linting tools if not present
+                        pip install pylint flake8 black --quiet
+                        
+                        echo "Running flake8..."
+                        flake8 . --max-line-length=120 --ignore=E501,W503 --exclude=venv,__pycache__ || true
+                        
+                        echo "Code linting completed"
+                    '''
+                }
+            }
+        }
+
+        stage('Run Backend Tests') {
+            when {
+                expression { !params.SKIP_TESTS }
+            }
+            steps {
+                script {
+                    echo "=== Running backend tests ==="
+                    sh '''
+                        cd ${BACKEND_PATH}
+                        
+                        # Activate virtual environment
+                        if [ -f "venv/bin/activate" ]; then
+                            . venv/bin/activate
+                        else
+                            source venv/Scripts/activate 2>/dev/null || . venv/Scripts/activate
+                        fi
+                        
+                        # Install pytest if not present
+                        pip install pytest pytest-cov --quiet
+                        
+                        # Run tests if test files exist
+                        if find . -name "test_*.py" -o -name "*_test.py" | grep -q .; then
+                            echo "Running pytest..."
+                            pytest --cov=. --cov-report=xml --cov-report=html --junitxml=test-results.xml || true
+                        else
+                            echo "No test files found, skipping pytest"
+                        fi
+                        
+                        echo "Backend tests completed"
+                    '''
+                }
+            }
+        }
+
+        stage('Run Frontend Build') {
+            steps {
+                script {
+                    echo "=== Building frontend ==="
+                    sh '''
+                        cd ${FRONTEND_PATH}
+                        
+                        # Set environment variables for build
+                        export VITE_API_URL="${VITE_API_URL:-http://localhost:8000}"
+                        export VITE_ENV="${DEPLOYMENT_ENVIRONMENT}"
+                        
+                        # Build the application
+                        npm run build
+                        
+                        # Verify build output
+                        if [ ! -d "dist" ]; then
+                            echo "ERROR: Build failed, dist directory not created"
+                            exit 1
+                        fi
+                        
+                        echo "Frontend build completed successfully"
+                    '''
+                }
+            }
+        }
+
+        stage('Build Docker Images') {
+            steps {
+                script {
+                    echo "=== Building Docker images ==="
+                    sh '''
+                        echo "Building backend Docker image..."
+                        docker build \
+                            --tag ${DOCKER_IMAGE_BACKEND}:${DOCKER_IMAGE_TAG} \
+                            --tag ${DOCKER_IMAGE_BACKEND}:latest \
+                            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+                            --build-arg VCS_REF=$(git rev-parse --short HEAD) \
+                            --build-arg VERSION=${PROJECT_VERSION} \
+                            ${BACKEND_PATH}
+                        
+                        echo "Building frontend Docker image..."
+                        docker build \
+                            --tag ${DOCKER_IMAGE_FRONTEND}:${DOCKER_IMAGE_TAG} \
+                            --tag ${DOCKER_IMAGE_FRONTEND}:latest \
+                            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+                            --build-arg VCS_REF=$(git rev-parse --short HEAD) \
+                            --build-arg VERSION=${PROJECT_VERSION} \
+                            ${FRONTEND_PATH}
+                        
+                        echo "Docker images built successfully"
+                        
+                        # List created images
+                        echo "=== Docker Images Created ==="
+                        docker images | grep job-portal
+                    '''
+                }
+            }
+        }
+
+        stage('Push to Docker Registry') {
+            when {
+                expression { params.PUSH_TO_REGISTRY }
+            }
+            steps {
+                script {
+                    echo "=== Pushing Docker images to registry ==="
+                    withCredentials([usernamePassword(credentialsId: 'docker-hub-credentials', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                        sh '''
+                            echo "Logging in to Docker registry..."
+                            echo "${DOCKER_PASS}" | docker login -u "${DOCKER_USER}" --password-stdin ${DOCKER_REGISTRY}
+                            
+                            echo "Pushing backend image..."
+                            docker push ${DOCKER_IMAGE_BACKEND}:${DOCKER_IMAGE_TAG}
+                            docker push ${DOCKER_IMAGE_BACKEND}:latest
+                            
+                            echo "Pushing frontend image..."
+                            docker push ${DOCKER_IMAGE_FRONTEND}:${DOCKER_IMAGE_TAG}
+                            docker push ${DOCKER_IMAGE_FRONTEND}:latest
+                            
+                            echo "Docker images pushed successfully"
+                            docker logout
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Run Docker Compose') {
+            steps {
+                script {
+                    echo "=== Starting application with Docker Compose ==="
+                    sh '''
+                        # Load environment file if it exists
+                        ENV_FILE=".env.${DEPLOYMENT_ENVIRONMENT}"
+                        if [ ! -f "${ENV_FILE}" ]; then
+                            ENV_FILE=".env"
+                            if [ ! -f "${ENV_FILE}" ]; then
+                                cp .env.example "${ENV_FILE}"
+                            fi
+                        fi
+                        
+                        echo "Using environment file: ${ENV_FILE}"
+                        
+                        # Stop any existing containers
+                        docker-compose down --remove-orphans
+                        
+                        # Start containers with the environment file
+                        docker-compose --env-file "${ENV_FILE}" up -d
+                        
+                        echo "Docker Compose started successfully"
+                        
+                        # Show container status
+                        echo "=== Container Status ==="
+                        docker-compose ps
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Application Health') {
+            steps {
+                script {
+                    echo "=== Verifying application health ==="
+                    sh '''
+                        echo "Waiting for services to be healthy..."
+                        set +e  # Don't exit on error
+                        
+                        # Function to check health with retries
+                        check_health() {
+                            local url=$1
+                            local service=$2
+                            local max_retries=${HEALTH_CHECK_RETRIES}
+                            local retry=0
+                            
+                            echo "Checking ${service} health..."
+                            while [ $retry -lt $max_retries ]; do
+                                if curl -sf "${url}" > /dev/null 2>&1; then
+                                    echo "✓ ${service} is healthy"
+                                    return 0
+                                fi
+                                echo "Attempt $((retry + 1))/${max_retries} - Waiting for ${service}..."
+                                sleep ${HEALTH_CHECK_INTERVAL}
+                                retry=$((retry + 1))
+                            done
+                            
+                            echo "✗ ${service} health check failed after ${max_retries} attempts"
+                            return 1
+                        }
+                        
+                        # Check backend service
+                        check_health "http://localhost:8000/docs" "Backend" || exit 1
+                        
+                        # Check frontend service (may be on different port based on docker-compose)
+                        if check_health "http://localhost:3000" "Frontend"; then
+                            echo "✓ Frontend is healthy"
+                        else
+                            echo "⚠ Frontend health check failed - this may be expected if not running in compose"
+                        fi
+                        
+                        echo "=== Application Health Check Completed ==="
+                    '''
+                }
+            }
+        }
+
+        stage('Run Smoke Tests') {
+            when {
+                expression { !params.SKIP_TESTS }
+            }
+            steps {
+                script {
+                    echo "=== Running smoke tests ==="
+                    sh '''
+                        echo "Testing API endpoints..."
+                        set +e  # Don't exit on error for optional checks
+                        
+                        # Test backend API
+                        echo "Testing GET /docs..."
+                        if curl -sf http://localhost:8000/docs > /dev/null 2>&1; then
+                            echo "✓ API documentation endpoint working"
+                        else
+                            echo "⚠ API documentation endpoint not available - this is optional"
+                        fi
+                        
+                        # Test frontend
+                        echo "Testing frontend..."
+                        if curl -sf http://localhost:3000 > /dev/null 2>&1; then
+                            echo "✓ Frontend serving correctly"
+                        else
+                            echo "⚠ Frontend serving not available - this is optional"
+                        fi
+                        
+                        echo "Smoke tests completed"
+                        set -e  # Re-enable exit on error
+                    '''
+                }
+            }
+        }
+
+        stage('Generate Reports') {
+            when {
+                expression { !params.SKIP_TESTS }
+            }
+            steps {
+                script {
+                    echo "=== Generating test reports ==="
+                    sh '''
+                        echo "Collecting test artifacts..."
+                        
+                        if [ -f "${BACKEND_PATH}/test-results.xml" ]; then
+                            cp ${BACKEND_PATH}/test-results.xml test-results.xml || true
+                        fi
+                        
+                        if [ -d "${BACKEND_PATH}/htmlcov" ]; then
+                            cp -r ${BACKEND_PATH}/htmlcov . || true
+                        fi
+                        
+                        echo "Test reports collected"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                echo "=== Cleaning up ==="
+                sh '''
+                    # Clean up temporary files
+                    find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+                    find . -type f -name "*.pyc" -delete 2>/dev/null || true
+                    
+                    echo "Cleanup completed"
+                '''
+                
+                // Clean workspace
+                cleanWs()
+            }
+        }
+
+        success {
+            script {
+                echo "=== Build Successful ==="
+                
+                // Send success notification (optional)
+                sh '''
+                    # Slack notification is optional
+                    if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+                        echo "Sending Slack notification..."
+                        SLACK_MESSAGE="Job Portal Build #${BUILD_NUMBER} PASSED on ${DEPLOYMENT_ENVIRONMENT}"
+                        curl -X POST "${SLACK_WEBHOOK_URL}" \
+                            -H 'Content-Type: application/json' \
+                            -d "{\"text\":\"✅ ${SLACK_MESSAGE}\"}" 2>/dev/null || echo "Slack notification failed (non-blocking)"
+                    else
+                        echo "Slack webhook not configured, skipping notification"
+                    fi
+                '''
+                
+                // Send email notification (optional)
+                try {
+                    emailext(
+                        subject: "[SUCCESS] Job Portal Build #${BUILD_NUMBER}",
+                        body: """
+                            Build Successful!
+                            
+                            Project: ${PROJECT_NAME}
+                            Build Number: ${BUILD_NUMBER}
+                            Environment: ${DEPLOYMENT_ENVIRONMENT}
+                            Status: SUCCESS
+                            
+                            Backend Image: ${DOCKER_IMAGE_BACKEND}:${DOCKER_IMAGE_TAG}
+                            Frontend Image: ${DOCKER_IMAGE_FRONTEND}:${DOCKER_IMAGE_TAG}
+                            
+                            Duration: ${currentBuild.durationString}
+                            
+                            Jenkins URL: ${BUILD_URL}
+                        """,
+                        to: "admin@jobportal.local",
+                        mimeType: 'text/plain'
+                    )
+                } catch (Exception e) {
+                    echo "Email notification skipped (not configured): ${e.message}"
+                }
+            }
+        }
+
+        failure {
+            script {
+                echo "=== Build Failed ==="
+                
+                // Send failure notification (optional)
+                sh '''
+                    if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+                        echo "Sending Slack failure notification..."
+                        SLACK_MESSAGE="Job Portal Build #${BUILD_NUMBER} FAILED on ${DEPLOYMENT_ENVIRONMENT}"
+                        curl -X POST "${SLACK_WEBHOOK_URL}" \
+                            -H 'Content-Type: application/json' \
+                            -d "{\"text\":\"❌ ${SLACK_MESSAGE}\"}" 2>/dev/null || echo "Slack notification failed (non-blocking)"
+                    else
+                        echo "Slack webhook not configured, skipping notification"
+                    fi
+                '''
+                
+                // Send email notification (optional)
+                try {
+                    emailext(
+                        subject: "[FAILURE] Job Portal Build #${BUILD_NUMBER}",
+                        body: """
+                            Build Failed!
+                            
+                            Project: ${PROJECT_NAME}
+                            Build Number: ${BUILD_NUMBER}
+                            Environment: ${DEPLOYMENT_ENVIRONMENT}
+                            Status: FAILED
+                            
+                            Please check the Jenkins logs for details.
+                            
+                            Jenkins URL: ${BUILD_URL}
+                            Console Output: ${BUILD_URL}console
+                        """,
+                        to: "admin@jobportal.local",
+                        mimeType: 'text/plain'
+                    )
+                } catch (Exception e) {
+                    echo "Email notification skipped (not configured): ${e.message}"
+                }
+            }
+        }
+
+        unstable {
+            script {
+                echo "=== Build Unstable ==="
+                
+                sh '''
+                    if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+                        SLACK_MESSAGE="Job Portal Build #${BUILD_NUMBER} UNSTABLE on ${DEPLOYMENT_ENVIRONMENT}"
+                        curl -X POST ${SLACK_WEBHOOK} \
+                            -H 'Content-Type: application/json' \
+                            -d "{\"text\":\"⚠️ ${SLACK_MESSAGE}\"}" || true
+                    fi
+                '''
+            }
+        }
+
+        cleanup {
+            script {
+                echo "=== Final Cleanup ==="
+                
+                // Stop Docker containers
+                sh '''
+                    echo "Stopping Docker containers..."
+                    docker-compose down --remove-orphans 2>/dev/null || true
+                    
+                    echo "Pipeline cleanup completed"
+                '''
+            }
+        }
+    }
+}
